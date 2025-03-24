@@ -1,0 +1,9 @@
+# requirements.txt
+azure-cognitiveservices-speech==1.25.0
+requests==2.28.2
+numpy==1.26.1
+pyaudio==0.2.13
+asyncio==3.4.3
+python-dotenv==1.0.0
+tkinter==8.6
+msal==1.22.0  # For Microsoft authentication
