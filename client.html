@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Live Audio Translation</title>
+    <script src="https://meet.jit.si/external_api.js"></script>
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <style>
+        #jitsi-container { width: 80%; height: 500px; margin: 0 auto; }
+        #subtitle-overlay {
+            position: fixed;
+            bottom: 50px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0,0,0,0.7);
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            font-size: 1.5em;
+            text-align: center;
+            min-width: 300px;
+            z-index: 1000;
+        }
+        .error { color: #ff4444; }
+        .original { font-weight: bold; }
+        .translated { font-style: italic; }
+        #mic-permission-btn {
+            background: #4285f4;
+            color: white;
+            border: none;
+            padding: 10px 15px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div id="jitsi-container"></div>
+    <div id="subtitle-overlay"></div>
+
+    <script>
+        // Audio Configuration - Updated for proper buffer sizes
+        const AUDIO_CONFIG = {
+            TARGET_SAMPLE_RATE: 16000,
+            BUFFER_DURATION: 0.512, // Results in 8192 samples (power of 2)
+            CHANNELS: 1
+        };
+
+        // DOM Elements
+        const subtitleElement = document.getElementById('subtitle-overlay');
+        
+        // Initialize Socket.IO
+        const socket = io('http://localhost:3001', {
+            transports: ["websocket"],
+            reconnection: true,
+            reconnectionAttempts: 5,
+            reconnectionDelay: 1000,
+            auth: {
+                clientType: "web"
+            }
+        });
+
+        // Audio processing variables
+        let audioContext, processor, mediaStream;
+        let jitsiApi;
+
+        // Socket.IO Event Handlers
+        socket.on('connect', () => {
+            console.log('Connected to server with ID:', socket.id);
+            initializeJitsi();
+        });
+
+        socket.on('connect_error', (err) => {
+            console.error('Connection error:', err.message);
+            showError(`Connection failed: ${err.message}`);
+        });
+
+        socket.on('translation_result', ({ original, translated }) => {
+            console.log('Received subtitles:', { original, translated });
+            subtitleElement.innerHTML = `
+                <div class="original">${original || '...'}</div>
+                <div class="translated">${translated || '...'}</div>
+            `;
+            
+            // Auto-clear subtitles after 5 seconds
+            clearTimeout(subtitleElement.timeout);
+            subtitleElement.timeout = setTimeout(() => {
+                subtitleElement.innerHTML = '';
+            }, 3000);
+        });
+
+        socket.on('processing_error', (error) => {
+            showError(typeof error === 'string' ? error : error.message);
+        });
+
+        // Jitsi Meet Integration
+        function initializeJitsi() {
+            jitsiApi = new JitsiMeetExternalAPI('meet.jit.si', {
+                roomName: 'LiveSubtitleRoom',
+                parentNode: document.querySelector('#jitsi-container'),
+                configOverwrite: {
+                    constraints: {
+                        audio: {
+                            sampleRate: AUDIO_CONFIG.TARGET_SAMPLE_RATE,
+                            channelCount: AUDIO_CONFIG.CHANNELS,
+                            latency: 0
+                        }
+                    }
+                },
+                interfaceConfigOverwrite: {
+                    DISABLE_JOIN_LEAVE_NOTIFICATIONS: true
+                }
+            });
+
+            jitsiApi.on('ready', () => {
+                if (!jitsiApi.isAudioMuted()) {
+                    initializeAudioProcessing();
+                }
+            });
+
+            jitsiApi.addListener('audioMuteStatusChanged', ({ muted }) => {
+                if (muted) {
+                    stopAudioProcessing();
+                } else {
+                    initializeAudioProcessing();
+                }
+            });
+        }
+
+        // Audio Processing Functions
+        function initializeAudioProcessing() {
+            navigator.permissions.query({ name: 'microphone' }).then(permissionStatus => {
+                if (permissionStatus.state === 'denied') {
+                    showError('Microphone access was blocked. Please enable it in browser settings.');
+                    return;
+                }
+
+                navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        sampleRate: AUDIO_CONFIG.TARGET_SAMPLE_RATE,
+                        channelCount: AUDIO_CONFIG.CHANNELS,
+                        echoCancellation: false,
+                        noiseSuppression: false,
+                        autoGainControl: false
+                    },
+                    video: false
+                }).then(stream => {
+                    mediaStream = stream;
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)({ 
+                        sampleRate: AUDIO_CONFIG.TARGET_SAMPLE_RATE 
+                    });
+                    
+                    const source = audioContext.createMediaStreamSource(stream);
+                    
+                    // Calculate power-of-2 buffer size
+                    const targetSamples = AUDIO_CONFIG.TARGET_SAMPLE_RATE * AUDIO_CONFIG.BUFFER_DURATION;
+                    const bufferSize = Math.pow(2, Math.floor(Math.log2(targetSamples)));
+                    const finalBufferSize = Math.min(16384, Math.max(256, bufferSize));
+                    
+                    console.log(`Audio processing started with buffer size: ${finalBufferSize}`);
+                    
+                    processor = audioContext.createScriptProcessor(finalBufferSize, 1, 1);
+                    let bufferAccumulator = new Float32Array(0);
+
+                    processor.onaudioprocess = (e) => {
+                        const inputBuffer = e.inputBuffer.getChannelData(0);
+                        bufferAccumulator = concatenateBuffers(bufferAccumulator, inputBuffer);
+                        
+                        if (bufferAccumulator.length >= finalBufferSize) {
+                            const sendBuffer = bufferAccumulator.slice(0, finalBufferSize);
+                            if (socket.connected) {
+                                socket.emit('audio_chunk', convertFloat32ToInt16(sendBuffer));
+                            }
+                            bufferAccumulator = bufferAccumulator.slice(finalBufferSize);
+                        }
+                    };
+
+                    source.connect(processor);
+                    processor.connect(audioContext.destination);
+                }).catch(err => {
+                    console.error('Microphone access error:', err);
+                    showError(`Microphone error: ${err.message}`, true);
+                });
+            });
+        }
+
+        function stopAudioProcessing() {
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(track => track.stop());
+            }
+            if (processor) {
+                processor.disconnect();
+            }
+            if (audioContext) {
+                audioContext.close();
+            }
+            console.log('Audio processing stopped');
+        }
+
+        // Utility Functions
+        function concatenateBuffers(a, b) {
+            const result = new Float32Array(a.length + b.length);
+            result.set(a);
+            result.set(b, a.length);
+            return result;
+        }
+
+        function convertFloat32ToInt16(buffer) {
+            const int16Buffer = new Int16Array(buffer.length);
+            for (let i = 0; i < buffer.length; i++) {
+                int16Buffer[i] = Math.min(1, Math.max(-1, buffer[i])) * 32767;
+            }
+            return int16Buffer;
+        }
+
+        function showError(message, showRetry = false) {
+            subtitleElement.innerHTML = `
+                <div class="error">${message}</div>
+                ${showRetry ? `<button id="mic-permission-btn" onclick="initializeAudioProcessing()">Retry Microphone Access</button>` : ''}
+            `;
+        }
+
+        // Cleanup
+        window.addEventListener('beforeunload', () => {
+            stopAudioProcessing();
+            if (jitsiApi) {
+                jitsiApi.dispose();
+            }
+            socket.disconnect();
+        });
+    </script>
+</body>
+</html>

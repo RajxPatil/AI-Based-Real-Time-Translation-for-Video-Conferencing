@@ -1,0 +1,21 @@
+{
+  "name": "mod1",
+  "version": "1.0.0",
+  "main": "app.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "brew": "^0.0.8",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "mkcert": "^3.2.0",
+    "nss": "^0.0.1",
+    "socket.io": "^4.8.1",
+    "socket.io-client": "^4.8.1"
+  }
+}
